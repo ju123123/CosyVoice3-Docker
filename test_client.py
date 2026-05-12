@@ -27,27 +27,42 @@ def test_health(base_url: str):
         return False
 
 
-def test_audio_speech(base_url: str, text: str, reference_aduio: str, reference_text: str, output_path: str):
+def test_audio_speech(
+        base_url: str,
+        text: str,
+        ref_audio: str,
+        ref_text: str,
+        response_format: str,
+        stream: bool,
+        output_path: str
+):
     """测试 OpenAI 兼容 TTS 接口"""
     print("\n[2] OpenAI audio/speech 测试")
     print(f"  文本: {text}")
-    print(f"  参考音频: {reference_aduio}")
-    print(f"  参考文本: {reference_text}")
+    print(f"  参考音频: {ref_audio}")
+    print(f"  参考文本: {ref_text}")
+    print(f"  格式: {response_format}")
+    print(f"  流式: {stream}")
     
     start_time = time.time()
     first_chunk_time = None
     total_bytes = 0
     
-    if not output_path.endswith(".wav"):
-        output_path += ".wav"
+    suffix = f".{response_format}"
+    if not output_path.endswith(suffix):
+        output_path += suffix
     
     try:
         resp = requests.post(
             f"{base_url}/v1/audio/speech",
             json={
+                "model": "tts-1",
                 "input": text,
-                "reference_aduio": reference_aduio,
-                "reference_text": reference_text
+                "task_type": "Base",
+                "ref_audio": ref_audio,
+                "ref_text": ref_text,
+                "response_format": response_format,
+                "stream": stream
             },
             stream=True,
             timeout=60
@@ -91,8 +106,10 @@ def main():
     parser = argparse.ArgumentParser(description="CosyVoice TTS 客户端测试")
     parser.add_argument("--url", type=str, default="http://localhost:10096", help="服务地址")
     parser.add_argument("--text", type=str, default="你好，我是小智，很高兴为您服务。", help="测试文本")
-    parser.add_argument("--reference_aduio", type=str, default="asset/longyingwan_woman.wav", help="参考音频路径")
-    parser.add_argument("--reference_text", type=str, default="我们将为全球城市的可持续发展贡献力量。", help="参考音频对应文本")
+    parser.add_argument("--ref_audio", type=str, default="asset/longyingwan_woman.wav", help="参考音频路径")
+    parser.add_argument("--ref_text", type=str, default="我们将为全球城市的可持续发展贡献力量。", help="参考音频对应文本")
+    parser.add_argument("--response_format", type=str, default="wav", help="输出格式: wav/mp3/flac/pcm/aac/opus")
+    parser.add_argument("--stream", action="store_true", help="流式返回PCM；需要 --response_format pcm")
     parser.add_argument("--output", type=str, default="output/client_test", help="输出文件路径")
     args = parser.parse_args()
     
@@ -112,7 +129,15 @@ def main():
         return
     
     # 测试 OpenAI 兼容 TTS
-    test_audio_speech(args.url, args.text, args.reference_aduio, args.reference_text, args.output)
+    test_audio_speech(
+        args.url,
+        args.text,
+        args.ref_audio,
+        args.ref_text,
+        args.response_format,
+        args.stream,
+        args.output
+    )
     
     print("\n" + "=" * 60)
     print("测试完成！")

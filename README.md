@@ -115,8 +115,14 @@ python test_client.py --text "你好，我是小智"
 # 或使用 curl
 curl -X POST http://localhost:10096/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"input":"你好","reference_aduio":"asset/longyingwan_woman.wav","reference_text":"我们将为全球城市的可持续发展贡献力量。"}' \
+  -d '{"model":"tts-1","input":"你好","task_type":"Base","ref_audio":"asset/longyingwan_woman.wav","ref_text":"我们将为全球城市的可持续发展贡献力量。","response_format":"wav"}' \
   -o test.wav
+
+# 流式 PCM
+curl -X POST http://localhost:10096/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1","input":"你好","task_type":"Base","ref_audio":"asset/longyingwan_woman.wav","ref_text":"我们将为全球城市的可持续发展贡献力量。","response_format":"pcm","stream":true}' \
+  -o test.pcm
 ```
 
 ## API 接口
@@ -136,10 +142,25 @@ Content-Type: application/json
 
 参数:
 - input (必需): 要合成的文本
-- reference_aduio (必需): 参考音频路径，支持绝对路径或相对项目根目录路径
-- reference_text (必需): 参考音频对应文本，不需要传 `You are a helpful assistant.<|endofprompt|>` 前缀，服务端会自动拼接
+- model (可选): 兼容字段，当前不切换模型
+- voice (可选): 预置音色ID，task_type=CustomVoice 时使用
+- response_format (可选): wav, mp3, flac, pcm, aac, opus
+- speed (可选): 非流式输出时调整播放速度
+- task_type (可选): CustomVoice, VoiceDesign, Base；传 ref_audio/ref_text 时默认 Base
+- language/instructions/max_new_tokens/initial_codec_chunk_frames (可选): vLLM-Omni 兼容字段，当前仅记录日志
+- stream (可选): true 时流式返回 PCM，要求 response_format=pcm
+- ref_audio (Base 必需): 参考音频，支持 URL、data URL、file:// URI、绝对路径或相对项目根目录路径
+- ref_text (Base 必需): 参考音频对应文本，不需要传 `You are a helpful assistant.<|endofprompt|>` 前缀，服务端会自动拼接
+- x_vector_only_mode (可选): 当前不支持 true
 
-响应: WAV 音频二进制数据
+响应: 音频二进制数据
+```
+
+### 音色列表
+
+```
+GET /v1/audio/voices
+响应: {"voices": ["longyingcheng", "longyingwan", ...], "uploaded_voices": []}
 ```
 
 ### vLLM 加速 (可选)

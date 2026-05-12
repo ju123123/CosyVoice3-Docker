@@ -5,7 +5,11 @@ import time
 import numpy as np
 import io
 import wave
-from typing import Generator
+import base64
+import tempfile
+from urllib.parse import urlparse, unquote
+from urllib.request import urlopen, Request
+from typing import Generator, Optional
 import threading
 import torch
 import torchaudio
@@ -73,6 +77,7 @@ default_voice_id = "default"  # 默认使用的音色ID
 # 默认 16000 以兼容小智平台
 output_sample_rate = 16000
 cosyvoice3_prompt_prefix = "You are a helpful assistant.<|endofprompt|>"
+supported_response_formats = {"wav", "mp3", "flac", "pcm", "aac", "opus"}
 
 # [注意] CosyVoice API 不支持传入 Tensor，必须传路径或文件对象，因此移除 resampler_cache 优化
 
@@ -82,15 +87,34 @@ app = FastAPI(title="CosyVoice TTS Server", version="1.0.0")
 
 class OpenAISpeechRequest(BaseModel):
     input: str = Field(..., description="要合成的文本")
-    reference_aduio: str = Field(..., description="参考音频路径")
-    reference_text: str = Field(..., description="参考音频对应文本，不需要包含 CosyVoice3 前缀")
+    model: Optional[str] = Field(default=None, description="OpenAI 兼容字段，当前服务不按 model 切换模型")
+    voice: str = Field(default=default_voice_id, description="预置音色ID，task_type=CustomVoice 时使用")
+    response_format: str = Field(default="wav", description="音频格式: wav, mp3, flac, pcm, aac, opus")
+    speed: float = Field(default=1.0, ge=0.25, le=4.0, description="播放速度，非流式输出时生效")
+    task_type: Optional[str] = Field(default=None, description="TTS任务类型: CustomVoice, VoiceDesign, Base")
+    language: str = Field(default="Auto", description="语言标识，当前仅记录日志")
+    instructions: str = Field(default="", description="声音风格/情感指令，当前仅记录日志")
+    max_new_tokens: int = Field(default=2048, ge=1, description="兼容字段，当前仅记录日志")
+    initial_codec_chunk_frames: Optional[int] = Field(default=None, ge=1, description="兼容字段，当前仅记录日志")
+    stream: bool = Field(default=False, description="是否流式返回原始PCM；要求 response_format=pcm")
+    ref_audio: Optional[str] = Field(default=None, description="Base任务参考音频: URL、data URL、file:// URI 或本地路径")
+    ref_text: Optional[str] = Field(default=None, description="Base任务参考音频转写文本，不需要包含 CosyVoice3 前缀")
+    x_vector_only_mode: Optional[bool] = Field(default=None, description="兼容字段，CosyVoice3当前不支持仅说话人向量模式")
 
     @root_validator(pre=True)
-    def accept_reference_audio_spelling(cls, values):
-        if "reference_aduio" not in values and "reference_audio" in values:
-            values["reference_aduio"] = values.pop("reference_audio")
+    def accept_legacy_reference_names(cls, values):
+        if "ref_audio" not in values and "reference_aduio" in values:
+            values["ref_audio"] = values.pop("reference_aduio")
+        if "ref_audio" not in values and "reference_audio" in values:
+            values["ref_audio"] = values.pop("reference_audio")
+        if "ref_text" not in values and "reference_text" in values:
+            values["ref_text"] = values.pop("reference_text")
+        if "reference_aduio" in values:
+            values.pop("reference_aduio")
         elif "reference_audio" in values:
             values.pop("reference_audio")
+        if "reference_text" in values:
+            values.pop("reference_text")
         return values
 
     class Config:
@@ -230,18 +254,19 @@ def encode_audio_response(pcm_bytes: bytes, response_format: str, sample_rate: i
     if fmt == "wav":
         return pcm16_bytes_to_wav_bytes(pcm_bytes, sample_rate), "audio/wav", "wav"
 
+    if fmt == "aac":
+        return encode_aac_response(pcm_bytes, sample_rate)
+
     format_map = {
         "mp3": ("MP3", "MPEG_LAYER_III", "audio/mpeg", "mp3"),
         "flac": ("FLAC", "PCM_16", "audio/flac", "flac"),
         "opus": ("OGG", "OPUS", "audio/ogg", "opus"),
     }
 
-    if fmt == "aac":
-        raise HTTPException(status_code=400, detail="response_format=aac 当前未启用编码器")
     if fmt not in format_map:
         raise HTTPException(
             status_code=400,
-            detail="response_format 仅支持: mp3, wav, pcm, flac, opus"
+            detail="response_format 仅支持: mp3, wav, pcm, flac, opus, aac"
         )
 
     import soundfile as sf
@@ -254,6 +279,42 @@ def encode_audio_response(pcm_bytes: bytes, response_format: str, sample_rate: i
     return out.read(), media_type, extension
 
 
+def encode_aac_response(pcm_bytes: bytes, sample_rate: int) -> tuple[bytes, str, str]:
+    """使用 PyAV 将 PCM16 mono 编码为 AAC/ADTS。"""
+    try:
+        import av
+    except ImportError as e:
+        raise HTTPException(status_code=400, detail="response_format=aac 需要安装 PyAV") from e
+
+    audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+    out = io.BytesIO()
+    container = av.open(out, mode="w", format="adts")
+    stream = container.add_stream("aac", rate=sample_rate)
+    stream.layout = "mono"
+
+    frame = av.AudioFrame.from_ndarray(audio.reshape(1, -1), format="s16", layout="mono")
+    frame.sample_rate = sample_rate
+    for packet in stream.encode(frame):
+        container.mux(packet)
+    for packet in stream.encode(None):
+        container.mux(packet)
+    container.close()
+    out.seek(0)
+    return out.read(), "audio/aac", "aac"
+
+
+def apply_speed_to_pcm(pcm_bytes: bytes, speed: float, sample_rate: int) -> bytes:
+    if abs(speed - 1.0) < 1e-3:
+        return pcm_bytes
+
+    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    audio_tensor = torch.from_numpy(audio).unsqueeze(0)
+    new_freq = max(1, int(sample_rate / speed))
+    sped = torchaudio.functional.resample(audio_tensor, orig_freq=sample_rate, new_freq=new_freq)
+    sped = torch.clamp(sped.squeeze(0), -1.0, 1.0)
+    return (sped * 32768).to(torch.int16).cpu().numpy().tobytes()
+
+
 def build_cosyvoice3_prompt_text(reference_text: str) -> str:
     text = reference_text.strip()
     if text.startswith(cosyvoice3_prompt_prefix):
@@ -261,23 +322,72 @@ def build_cosyvoice3_prompt_text(reference_text: str) -> str:
     return f"{cosyvoice3_prompt_prefix}{text}"
 
 
-def resolve_reference_audio_path(reference_audio: str) -> str:
-    path = reference_audio.strip()
+def resolve_local_audio_path(path: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.join(SCRIPT_DIR, path)
 
 
-def reference_audio_error_response(reference_audio: str, resolved_path: str) -> dict:
+def prepare_ref_audio(ref_audio: str) -> tuple[str, Optional[str]]:
+    """解析 vLLM-Omni ref_audio，返回本地路径和需要清理的临时文件路径。"""
+    value = ref_audio.strip()
+    parsed = urlparse(value)
+
+    if parsed.scheme in ("http", "https"):
+        suffix = os.path.splitext(parsed.path)[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            req = Request(value, headers={"User-Agent": "cosyvoice-tts-server"})
+            with urlopen(req, timeout=30) as resp:
+                tmp.write(resp.read())
+            return tmp.name, tmp.name
+
+    if parsed.scheme == "file":
+        return unquote(parsed.path), None
+
+    if value.startswith("data:"):
+        header, _, payload = value.partition(",")
+        if ";base64" not in header or not payload:
+            raise HTTPException(status_code=400, detail="ref_audio data URL 必须是 base64 格式")
+        mime = header[5:].split(";")[0]
+        suffix = {
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/flac": ".flac",
+            "audio/ogg": ".ogg",
+        }.get(mime, ".wav")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(base64.b64decode(payload))
+            return tmp.name, tmp.name
+
+    return resolve_local_audio_path(value), None
+
+
+def reference_audio_error_response(ref_audio: str, resolved_path: str) -> dict:
     return {
         "error": {
-            "message": f"参考音频不存在，请检查 reference_aduio 路径：{reference_audio}",
+            "message": f"参考音频不存在，请检查 ref_audio 路径：{ref_audio}",
             "type": "invalid_request_error",
-            "param": "reference_aduio",
+            "param": "ref_audio",
             "code": "reference_audio_not_found"
         },
         "resolved_path": resolved_path
     }
+
+
+def error_response(status_code: int, message: str, param: str, code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": code
+            }
+        }
+    )
 
 
 @app.get("/health")
@@ -305,6 +415,14 @@ async def health_check():
     })
 
 
+@app.get("/v1/audio/voices")
+async def list_audio_voices():
+    return JSONResponse({
+        "voices": list(voice_cache.keys()),
+        "uploaded_voices": []
+    })
+
+
 @app.post("/v1/audio/speech")
 async def openai_audio_speech(req: OpenAISpeechRequest):
     """
@@ -312,8 +430,9 @@ async def openai_audio_speech(req: OpenAISpeechRequest):
 
     入参 JSON:
       - input: 要合成的文本
-      - reference_aduio: 参考音频路径
-      - reference_text: 参考音频对应文本，服务端自动拼接 CosyVoice3 前缀
+      - model/voice/response_format/speed: OpenAI speech 标准字段
+      - task_type/language/instructions/max_new_tokens/initial_codec_chunk_frames/stream: vLLM-Omni 扩展字段
+      - ref_audio/ref_text/x_vector_only_mode: vLLM-Omni Base 声音克隆字段
     """
     if cosyvoice is None:
         raise HTTPException(status_code=503, detail="模型未加载")
@@ -322,37 +441,167 @@ async def openai_audio_speech(req: OpenAISpeechRequest):
     if not text:
         raise HTTPException(status_code=400, detail="input 不能为空")
 
-    reference_audio = req.reference_aduio.strip() if req.reference_aduio else ""
-    if not reference_audio:
-        raise HTTPException(status_code=400, detail="reference_aduio 不能为空")
+    task_type = req.task_type or ("Base" if req.ref_audio or req.ref_text else "CustomVoice")
+    task_type_map = {
+        "customvoice": "CustomVoice",
+        "voicedesign": "VoiceDesign",
+        "base": "Base",
+    }
+    normalized_task_type = task_type_map.get(task_type.lower())
+    if normalized_task_type is None:
+        return error_response(
+            400,
+            "task_type 仅支持 CustomVoice、VoiceDesign、Base",
+            "task_type",
+            "unsupported_task_type"
+        )
+    task_type = normalized_task_type
 
-    reference_text = req.reference_text.strip() if req.reference_text else ""
-    if not reference_text:
-        raise HTTPException(status_code=400, detail="reference_text 不能为空")
-
-    reference_audio_path = resolve_reference_audio_path(reference_audio)
-    if not os.path.exists(reference_audio_path):
-        return JSONResponse(
-            status_code=400,
-            content=reference_audio_error_response(reference_audio, reference_audio_path)
+    response_format = req.response_format.lower().strip()
+    if response_format not in supported_response_formats:
+        return error_response(
+            400,
+            "response_format 仅支持: wav, mp3, flac, pcm, aac, opus",
+            "response_format",
+            "unsupported_response_format"
+        )
+    if req.stream and response_format != "pcm":
+        return error_response(
+            400,
+            "stream=true 时 response_format 必须为 pcm",
+            "response_format",
+            "stream_requires_pcm"
+        )
+    if req.stream and abs(req.speed - 1.0) >= 1e-3:
+        return error_response(
+            400,
+            "stream=true 时暂不支持 speed 调整，请使用 speed=1.0",
+            "speed",
+            "stream_speed_unsupported"
+        )
+    if req.x_vector_only_mode:
+        return error_response(
+            400,
+            "当前 CosyVoice3 服务不支持 x_vector_only_mode=true，请同时传 ref_audio 和 ref_text",
+            "x_vector_only_mode",
+            "x_vector_only_mode_unsupported"
+        )
+    if task_type == "VoiceDesign":
+        return error_response(
+            400,
+            "当前 CosyVoice3 服务不支持 VoiceDesign，请使用 task_type=Base 并传 ref_audio/ref_text",
+            "task_type",
+            "voice_design_unsupported"
+        )
+    if task_type != "Base" and (req.ref_audio or req.ref_text):
+        return error_response(
+            400,
+            "ref_audio/ref_text 仅支持 task_type=Base；如需声音克隆请使用 task_type=Base",
+            "task_type",
+            "reference_fields_require_base"
         )
 
-    prompt_text = build_cosyvoice3_prompt_text(reference_text)
-    response_format = "wav"
+    temp_ref_audio_path = None
+    prompt_text = None
+    prompt_wav = None
+    voice_id = None
+
+    if task_type == "Base":
+        ref_audio = req.ref_audio.strip() if req.ref_audio else ""
+        if not ref_audio:
+            raise HTTPException(status_code=400, detail="task_type=Base 时 ref_audio 不能为空")
+
+        ref_text = req.ref_text.strip() if req.ref_text else ""
+        if not ref_text:
+            raise HTTPException(status_code=400, detail="task_type=Base 时 ref_text 不能为空")
+
+        try:
+            prompt_wav, temp_ref_audio_path = prepare_ref_audio(ref_audio)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"参考音频读取失败: {e}")
+            return error_response(400, f"参考音频读取失败：{e}", "ref_audio", "reference_audio_load_failed")
+
+        if not os.path.exists(prompt_wav):
+            return JSONResponse(
+                status_code=400,
+                content=reference_audio_error_response(ref_audio, prompt_wav)
+            )
+        prompt_text = build_cosyvoice3_prompt_text(ref_text)
+    else:
+        voice_id = req.voice.strip() if req.voice else default_voice_id
+        if voice_id not in voice_cache:
+            return error_response(
+                400,
+                f"音色 '{voice_id}' 未加载，可用音色: {list(voice_cache.keys())}",
+                "voice",
+                "voice_not_found"
+            )
+        prompt_wav = voice_cache[voice_id]["file"]
+        prompt_text = voice_cache[voice_id]["prompt_text"]
+        if not os.path.exists(prompt_wav):
+            return JSONResponse(
+                status_code=400,
+                content=reference_audio_error_response(prompt_wav, prompt_wav)
+            )
+
     logger.info(
-        f"TTS 请求: text='{text[:50]}...', reference_aduio='{reference_audio_path}', "
-        f"reference_text='{reference_text[:50]}...', response_format='{response_format}'"
+        f"TTS 请求: text='{text[:50]}...', task_type='{task_type}', voice='{voice_id}', "
+        f"ref_audio='{prompt_wav}', response_format='{response_format}', stream={req.stream}, "
+        f"speed={req.speed}, language='{req.language}', max_new_tokens={req.max_new_tokens}, "
+        f"initial_codec_chunk_frames={req.initial_codec_chunk_frames}"
     )
 
     start_time = time.time()
 
     try:
+        if req.stream:
+            def pcm_stream_generator():
+                first_chunk = True
+                total_bytes = 0
+                try:
+                    for chunk in generate_audio_stream(
+                            text=text,
+                            voice_id=voice_id,
+                            prompt_text=prompt_text,
+                            prompt_wav=prompt_wav,
+                            stream=True,
+                            use_spk_cache=False
+                    ):
+                        if first_chunk:
+                            logger.info(f"⚡ 首帧延迟: {(time.time() - start_time) * 1000:.0f}ms")
+                            first_chunk = False
+                        total_bytes += len(chunk)
+                        yield chunk
+                    logger.info(
+                        f"✅ TTS 完成: 总耗时 {(time.time() - start_time) * 1000:.0f}ms, "
+                        f"PCM={total_bytes / 1024:.1f}KB, format=pcm, stream=true"
+                    )
+                finally:
+                    if temp_ref_audio_path and os.path.exists(temp_ref_audio_path):
+                        os.unlink(temp_ref_audio_path)
+
+            return StreamingResponse(
+                pcm_stream_generator(),
+                media_type="application/octet-stream",
+                headers={
+                    "X-Sample-Rate": str(output_sample_rate),
+                    "X-Channels": "1",
+                    "X-Bits": "16",
+                    "X-Task-Type": task_type,
+                    "X-Audio-Format": "pcm",
+                    "X-Stream": "true"
+                }
+            )
+
         pcm_chunks = []
         first_chunk = True
         for chunk in generate_audio_stream(
                 text=text,
+                voice_id=voice_id,
                 prompt_text=prompt_text,
-                prompt_wav=reference_audio_path,
+                prompt_wav=prompt_wav,
                 stream=False,
                 use_spk_cache=False
         ):
@@ -365,6 +614,7 @@ async def openai_audio_speech(req: OpenAISpeechRequest):
             raise RuntimeError("没有生成任何音频数据")
 
         pcm_bytes = b"".join(pcm_chunks)
+        pcm_bytes = apply_speed_to_pcm(pcm_bytes, req.speed, output_sample_rate)
         audio_bytes, media_type, extension = encode_audio_response(
             pcm_bytes=pcm_bytes,
             response_format=response_format,
@@ -385,8 +635,9 @@ async def openai_audio_speech(req: OpenAISpeechRequest):
                 "X-Sample-Rate": str(output_sample_rate),
                 "X-Channels": "1",
                 "X-Bits": "16",
-                "X-Reference-Audio": reference_audio_path,
-                "X-Audio-Format": extension
+                "X-Task-Type": task_type,
+                "X-Audio-Format": extension,
+                "X-Stream": "false"
             }
         )
     except HTTPException:
@@ -399,15 +650,18 @@ async def openai_audio_speech(req: OpenAISpeechRequest):
                 "error": {
                     "message": str(e),
                     "type": "invalid_request_error",
-                    "param": "reference_aduio",
+                    "param": "ref_audio",
                     "code": "reference_audio_not_found"
                 },
-                "resolved_path": reference_audio_path
+                "resolved_path": prompt_wav
             }
         )
     except Exception as e:
         logger.exception("TTS 生成失败")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not req.stream and temp_ref_audio_path and os.path.exists(temp_ref_audio_path):
+            os.unlink(temp_ref_audio_path)
 
 
 def register_cosyvoice_vllm_model():

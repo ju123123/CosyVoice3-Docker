@@ -216,7 +216,7 @@ echo "3. 启动服务: ./start_server.sh"
 # 或使用 curl:
 # curl -X POST http://localhost:10096/v1/audio/speech \
 #   -H "Content-Type: application/json" \
-#   -d '{"input":"你好","reference_aduio":"asset/longyingwan_woman.wav","reference_text":"我们将为全球城市的可持续发展贡献力量。"}' \
+#   -d '{"model":"tts-1","input":"你好","task_type":"Base","ref_audio":"asset/longyingwan_woman.wav","ref_text":"我们将为全球城市的可持续发展贡献力量。","response_format":"wav"}' \
 #   -o test.wav
 #
 # ==========================================
