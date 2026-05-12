@@ -2,9 +2,9 @@ services:
   cosyvoice3:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.patch
+      dockerfile: docker/Dockerfile
 
-    image: fun-cosyvoice3-0.5b-2512:2.0
+    image: ${IMAGE_NAME:-fun-cosyvoice3-0.5b-2512:2.0}
     container_name: ${CONTAINER_NAME:-fun-cosyvoice3}
     restart: unless-stopped
 
@@ -19,7 +19,6 @@ services:
       - ../asset:/app/asset
       - ../output:/app/output
       - ../cache/modelscope:/root/.cache/modelscope
-      - ../cosyvoice:/app/cosyvoice
       - ./docker-entrypoint.sh:/docker-entrypoint.sh
       - ../cosyvoice_server.py:/app/cosyvoice_server.py
       - ../test_client.py:/app/test_client.py

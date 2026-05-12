@@ -1,295 +1,405 @@
-# Fun-CosyVoice3-0.5B-2512 Linux 部署指南
+# Fun-CosyVoice3 TTS Docker 部署说明
 
-本项目提供 Fun-CosyVoice3-0.5B-2512 语音合成服务的简化部署方案，以及快速测试和部署提供应用调用。
+本项目提供基于 FastAPI 的 Fun-CosyVoice3-0.5B 语音合成服务，接口兼容 OpenAI `/v1/audio/speech`，并支持部分 vLLM-Omni Speech API 扩展参数。
 
-## 功能特性
+## 功能
 
-### ✅ 支持的特性
+- Docker / Docker Compose 部署
+- GPU 推理，支持 CUDA 12.1 基础镜像
+- 可选 vLLM 加速
+- OpenAI 兼容 TTS 接口
+- vLLM-Omni 风格扩展参数：`task_type`、`stream`、`ref_audio`、`ref_text` 等
+- 支持非流式音频输出：`wav`、`mp3`、`flac`、`pcm`、`aac`、`opus`
+- 支持 `stream=true` 流式 PCM 输出
+- `ref_text` 自动拼接 CosyVoice3 前缀：`You are a helpful assistant.<|endofprompt|>`
 
-| 特性 | 说明 |
-|------|------|
-| **vLLM 加速** | 可选启用，推理速度提升 40%+，首帧延迟显著降低 |
-| **流式音频输出** | TTS 边生成边返回 PCM 数据，支持实时播放 |
-| **可配置采样率** | 支持 16kHz（兼容小智平台）和 24kHz（原生高质量）两种输出 |
-| **多音色预加载** | 支持配置多个音色，启动时预缓存特征，运行时零延迟切换 |
-| **Zero-Shot 声音复刻** | 只需 5-15 秒参考音频即可克隆任意音色 |
-| **GPU 加速重采样** | 采样率转换在 GPU 上完成，高效节省带宽 |
-| **Speaker 特征缓存** | 默认音色特征启动时缓存，推理时零 I/O |
+## 目录
 
-### ❌ 不支持的特性
-
-| 特性 | 原因 |
-|------|------|
-| **流式文本输入** | 当前使用 HTTP POST，需完整文本后才开始合成，流式输入意义不大，除非LLM推理输出很慢 |
-| **单实例高并发** | GPU 推理需串行执行，多请求需排队等待 |
-| **多 GPU 自动均衡** | 如需大并发，需手动部署多实例 + 负载均衡 |
-| **实时音色切换 API** | 非预加载音色需实时计算特征，首帧延迟较高，可以预加载中加入 |
-
+```text
+.
+├── cosyvoice_server.py
+├── download_model.py
+├── requirements.txt
+├── test_client.py
+├── asset/
+├── models/
+└── docker/
+    ├── Dockerfile
+    ├── docker-compose.yml
+    ├── docker-entrypoint.sh
+    ├── build-docker-image.sh
+    └── .env
+```
 
 ## 环境要求
 
-- GPU: ~5.2GB 显存 (RTX 3090 实测)
-- Python: 3.10+
-- CUDA: 12.x
-- 系统: Linux (Ubuntu/CentOS)
+- Linux 主机
+- NVIDIA GPU，建议显存 8GB 以上
+- 已安装 NVIDIA 驱动
+- 已安装 Docker Engine
+- 已安装 NVIDIA Container Toolkit
+- 已安装 Docker Compose v2
 
-## 目录结构
+检查 GPU 容器能力：
 
+```bash
+docker run --rm --gpus all nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi
 ```
-deploy/cosyvoice/
-├── README.md                # 本文档
-├── requirements.txt         # Python 依赖列表
-├── install.sh               # 环境安装脚本
-├── download_model.py        # 模型下载脚本
-├── cosyvoice_server.py      # FastAPI 流式服务端
-├── start_server.sh          # 启动脚本
-├── test_inference.py        # 本地推理测试
-├── test_client.py           # 客户端测试脚本
-├── official/                # CosyVoice 官方源码 (自动克隆)
-├── asset/                   # 预置音色文件
-└── models/                  # 模型目录 (自动创建)
-    └── Fun-CosyVoice3-0.5B/
-```
+
+如果该命令不能正常显示 GPU 信息，请先修复 NVIDIA Container Toolkit 配置。
 
 ## 快速部署
 
-### 方式一：自动安装（推荐）
+### 1. 准备目录
 
 ```bash
-cd /data/cosyvoice
-chmod +x install.sh start_server.sh
-./install.sh
+mkdir -p models asset output cache/modelscope
 ```
 
-### 方式二：手动安装
+项目已包含示例音频：
 
-```bash
-# 1. 创建 Conda 环境
-conda create -n cosyvoice python=3.10 -y
-conda activate cosyvoice
-
-# 2. 升级 pip
-pip install --upgrade pip
-
-# 3. 安装 PyTorch
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# 4. 安装 onnxruntime-gpu (从微软源)
-pip install onnxruntime-gpu==1.18.0 \
-    --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
-
-# 5. 安装其他依赖
-pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
-
-# 6. 克隆官方源码
-git clone --depth 1 https://github.com/FunAudioLLM/CosyVoice.git official
-cd official && git submodule update --init --recursive && cd ..
-
-# 7. 创建软链接
-ln -sf official/cosyvoice ./cosyvoice
-ln -sf official/third_party ./third_party
-mkdir -p models asset output
-
-# 8. 下载模型
-python download_model.py
+```text
+asset/longyingcheng_man.wav
+asset/longyingwan_woman.wav
+asset/longyingmu_woman.wav
 ```
 
-## 启动服务
+### 2. 配置 Docker 参数
 
-```bash
-conda activate cosyvoice
-./start_server.sh
+编辑 [docker/.env](docker/.env)：
+
+```env
+HOST_PORT=10096
+SERVER_PORT=10096
+GPU_DEVICE_ID=0
+MODEL_DIR=/app/models/Fun-CosyVoice3-0.5B
+USE_VLLM=true
+USE_FP16=false
+OUTPUT_SAMPLE_RATE=24000
 ```
 
-服务监听 `0.0.0.0:10096` 端口。
+如果机器只有一张 GPU，通常设置：
 
-## 验证服务
+```env
+GPU_DEVICE_ID=0
+```
+
+如需输出 16kHz PCM：
+
+```env
+OUTPUT_SAMPLE_RATE=16000
+```
+
+### 3. 构建镜像
 
 ```bash
-# 健康检查
+cd docker
+docker compose build
+```
+
+也可以使用构建脚本：
+
+```bash
+cd docker
+bash build-docker-image.sh
+```
+
+### 4. 下载模型
+
+容器启动时会检查 `/app/models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml`。如果模型不存在，服务会退出并提示下载。
+
+推荐直接在容器里下载到挂载目录：
+
+```bash
+cd docker
+docker compose run --rm --entrypoint bash cosyvoice3 -lc "cd /app && python download_model.py"
+```
+
+下载完成后，宿主机目录应包含：
+
+```text
+models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml
+```
+
+### 5. 启动服务
+
+```bash
+cd docker
+docker compose up -d
+```
+
+查看日志：
+
+```bash
+docker compose logs -f cosyvoice3
+```
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+## 服务验证
+
+健康检查：
+
+```bash
 curl http://localhost:10096/health
+```
 
-# 测试 TTS
-python test_client.py --text "你好，我是小智"
+音色列表：
 
-# 或使用 curl
+```bash
+curl http://localhost:10096/v1/audio/voices
+```
+
+非流式 WAV：
+
+```bash
 curl -X POST http://localhost:10096/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model":"tts-1","input":"你好","task_type":"Base","ref_audio":"asset/longyingwan_woman.wav","ref_text":"我们将为全球城市的可持续发展贡献力量。","response_format":"wav"}' \
+  -d '{
+    "input": "你好，这是一段测试音频。",
+    "task_type": "Base",
+    "ref_audio": "asset/longyingwan_woman.wav",
+    "ref_text": "我们将为全球城市的可持续发展贡献力量。",
+    "response_format": "wav"
+  }' \
   -o test.wav
+```
 
-# 流式 PCM
+流式 PCM：
+
+```bash
 curl -X POST http://localhost:10096/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model":"tts-1","input":"你好","task_type":"Base","ref_audio":"asset/longyingwan_woman.wav","ref_text":"我们将为全球城市的可持续发展贡献力量。","response_format":"pcm","stream":true}' \
+  -d '{
+    "input": "你好，这是一段测试音频。",
+    "task_type": "Base",
+    "ref_audio": "asset/longyingwan_woman.wav",
+    "ref_text": "我们将为全球城市的可持续发展贡献力量。",
+    "response_format": "pcm",
+    "stream": true
+  }' \
   -o test.pcm
 ```
 
-## API 接口
-
-### 健康检查
-
-```
-GET /health
-响应: {"status": "ok", "model": "Fun-CosyVoice3-0.5B-2512", ...}
-```
-
-### OpenAI 兼容 TTS
-
-```
-POST /v1/audio/speech
-Content-Type: application/json
-
-参数:
-- input (必需): 要合成的文本
-- model (可选): 兼容字段，当前不切换模型
-- voice (可选): 预置音色ID，task_type=CustomVoice 时使用
-- response_format (可选): wav, mp3, flac, pcm, aac, opus
-- speed (可选): 非流式输出时调整播放速度
-- task_type (可选): CustomVoice, VoiceDesign, Base；传 ref_audio/ref_text 时默认 Base
-- language/instructions/max_new_tokens/initial_codec_chunk_frames (可选): vLLM-Omni 兼容字段，当前仅记录日志
-- stream (可选): true 时流式返回 PCM，要求 response_format=pcm
-- ref_audio (Base 必需): 参考音频，支持 URL、data URL、file:// URI、绝对路径或相对项目根目录路径
-- ref_text (Base 必需): 参考音频对应文本，不需要传 `You are a helpful assistant.<|endofprompt|>` 前缀，服务端会自动拼接
-- x_vector_only_mode (可选): 当前不支持 true
-
-响应: 音频二进制数据
-```
-
-### 音色列表
-
-```
-GET /v1/audio/voices
-响应: {"voices": ["longyingcheng", "longyingwan", ...], "uploaded_voices": []}
-```
-
-### vLLM 加速 (可选)
-
-本项目支持使用 `vllm` 库加速推理 (仅限 Linux + CUDA)。
-
-**启用方式**:
-1. 安装时选择安装 vLLM (或运行 `pip install vllm==0.9.0`)。
-2. 启动服务时添加 `--use_vllm` 参数。
+播放 PCM：
 
 ```bash
-# 启动服务
-python cosyvoice_server.py --use_vllm
-
-# 本地测试
-python test_inference.py --use_vllm
+ffplay -f s16le -ar 24000 -ac 1 test.pcm
 ```
 
-> [!NOTE]
-> vLLM 模式下，默认 GPU 显存占用率限制为 **0.2** (约 4.8GB)，这是为了给 FunASR 和 LLM 预留显存。如需修改，请修改 `cosyvoice/cli/model.py` 中的 `gpu_memory_utilization` 参数。
+如果 `.env` 中设置 `OUTPUT_SAMPLE_RATE=16000`，播放命令改为：
 
-### 输出采样率配置
-
-CosyVoice3 模型原生输出 **24kHz** 音频，但小智平台使用 **16kHz**。服务端提供了可配置的采样率转换功能，**在 GPU 上高效重采样**。
-
-**启动参数**:
 ```bash
-# 默认 16kHz (兼容小智平台)
-./start_server.sh --use_vllm
-
-# 原生高质量 24kHz (用于其他场景)
-./start_server.sh --use_vllm --output_sample_rate 24000
+ffplay -f s16le -ar 16000 -ac 1 test.pcm
 ```
 
-> [!TIP]
-> GPU 重采样效率极高 (使用 `torchaudio.functional.resample`)，同时减少 33% 网络传输数据量。
+## API
 
-## 性能优化亮点
+### `GET /health`
 
-通过针对性的深度优化，本项目在消费级显卡上实现了极致的推理性能：
+返回服务状态、模型采样率、输出采样率、可用音色等信息。
 
-1.  **vLLM 加速后端 (可选)**
-    - **原理**: 引入 vLLM 替代 PyTorch 进行 LLM 推理，利用 PagedAttention 和高度优化的 CUDA Kernels。
-    - **效果**: 推理速度提升 **40%+**，显著降低首帧延迟。
-    - **显存**: 自动控制显存占用 (4.8GB)，实现与 FunASR 的完美共存。
+### `GET /v1/audio/voices`
 
-2.  **零 I/O 特征缓存 (Zero-Shot Speaker Caching)**
-    - **原理**: 启动时预先计算默认音色的声学特征 (Emb/Feat) 并常驻内存。
-    - **效果**: 默认音色推理实现 **零 I/O / 零特征提取**，极致响应。
+返回预置音色列表。
 
-3.  **GPU 加速后处理 (GPU PCM Conversion)**
-    - **原理**: 将音频 Float32 -> Int16 的转换和归一化操作移至 GPU 执行。
-    - **效果**: 降低服务端 CPU 负载，减少 50% 的 GPU-CPU 数据传输带宽。
+响应示例：
 
-## 常见问题 (Q&A)
+```json
+{
+  "voices": ["longyingcheng", "longyingwan", "longyingmu"],
+  "uploaded_voices": []
+}
+```
 
-### Q1: 生成的音频是乱音/噪音
+### `POST /v1/audio/speech`
 
-**原因**: `transformers` 库版本不对
+请求体为 JSON。
 
-**解决**:
+#### OpenAI 兼容字段
+
+| 参数 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| `model` | string | 否 | 兼容字段，当前不切换模型 |
+| `input` | string | 是 | 要合成的文本 |
+| `voice` | string | 否 | `task_type=CustomVoice` 时使用预置音色 |
+| `response_format` | string | 否 | `wav`、`mp3`、`flac`、`pcm`、`aac`、`opus`，默认 `wav` |
+| `speed` | number | 否 | 非流式输出时调整播放速度，范围 `0.25` 到 `4.0` |
+
+#### vLLM-Omni 扩展字段
+
+| 参数 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| `task_type` | string | 否 | `CustomVoice`、`Base`、`VoiceDesign`；传 `ref_audio/ref_text` 时默认 `Base` |
+| `language` | string | 否 | 兼容字段，当前仅记录日志 |
+| `instructions` | string | 否 | 兼容字段，当前仅记录日志 |
+| `max_new_tokens` | integer | 否 | 兼容字段，当前仅记录日志 |
+| `initial_codec_chunk_frames` | integer | 否 | 兼容字段，当前仅记录日志 |
+| `stream` | boolean | 否 | `true` 时流式返回 PCM，要求 `response_format=pcm` |
+| `ref_audio` | string | Base 必需 | 参考音频，支持 URL、data URL、`file://`、绝对路径、相对项目根目录路径 |
+| `ref_text` | string | Base 必需 | 参考音频对应文本，不需要传 CosyVoice3 前缀 |
+| `x_vector_only_mode` | boolean | 否 | 当前不支持 `true` |
+
+当前实现限制：
+
+- `VoiceDesign` 暂不支持，会返回 400。
+- `x_vector_only_mode=true` 暂不支持，会返回 400。
+- `stream=true` 时必须设置 `response_format=pcm`。
+- `stream=true` 时暂不支持 `speed` 调整。
+
+## 参考音频要求
+
+- 建议 WAV 格式。
+- 建议 5 到 15 秒。
+- 建议单声道，16kHz 或 24kHz。
+- `ref_text` 必须与参考音频内容一致。
+- `ref_text` 不需要包含 `You are a helpful assistant.<|endofprompt|>`，服务端会自动补齐。
+
+参考音频路径说明：
+
+- `asset/demo.wav` 会解析为容器内 `/app/asset/demo.wav`。
+- `/app/asset/demo.wav` 会作为绝对路径使用。
+- `file:///app/asset/demo.wav` 会解析为本地文件。
+- `https://.../demo.wav` 会下载到临时文件后使用。
+- `data:audio/wav;base64,...` 会写入临时文件后使用。
+
+参考音频不存在时，接口返回：
+
+```json
+{
+  "error": {
+    "message": "参考音频不存在，请检查 ref_audio 路径：asset/missing.wav",
+    "type": "invalid_request_error",
+    "param": "ref_audio",
+    "code": "reference_audio_not_found"
+  },
+  "resolved_path": "/app/asset/missing.wav"
+}
+```
+
+## Docker Compose 常用命令
+
 ```bash
-pip install transformers==4.51.3
+cd docker
+
+# 构建镜像
+docker compose build
+
+# 前台启动
+docker compose up
+
+# 后台启动
+docker compose up -d
+
+# 查看日志
+docker compose logs -f cosyvoice3
+
+# 重启服务
+docker compose restart cosyvoice3
+
+# 停止并删除容器
+docker compose down
+
+# 进入容器
+docker compose exec cosyvoice3 bash
 ```
 
-### Q2: 报错 `libcudnn.so.8: cannot open shared object file`
+## 环境变量
 
-**原因**: cuDNN 8.x 库未正确配置，ONNX Runtime 无法启用 GPU 加速。
+主要配置在 [docker/.env](docker/.env)：
 
-**解决**:
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HOST_PORT` | `10096` | 宿主机端口 |
+| `SERVER_PORT` | `10096` | 容器内服务端口 |
+| `GPU_DEVICE_ID` | `1` | 使用哪张 GPU；单卡通常改为 `0` |
+| `MODEL_DIR` | `/app/models/Fun-CosyVoice3-0.5B` | 容器内模型目录 |
+| `USE_VLLM` | `true` | 是否启用 vLLM |
+| `USE_FP16` | `false` | 是否启用 FP16 |
+| `OUTPUT_SAMPLE_RATE` | `24000` | 输出采样率，可设为 `16000` 或 `24000` |
+| `SHM_SIZE` | `8g` | 容器共享内存大小 |
 
-- **如果是普通部署** (无 vLLM):
-  ```bash
-  pip install nvidia-cudnn-cu12==8.9.7.29
-  export LD_LIBRARY_PATH=... (见 install.sh)
-  ```
+## 故障排查
 
-- **如果启用了 vLLM** (推荐):
-  **请忽略此报错！**
-  vLLM 依赖新版 cuDNN (v9)，强制降级会导致 vLLM 无法启动。ONNX Runtime 会自动回退到 CPU 运行辅助模型，对整体速度几无影响。
+### 容器无法看到 GPU
 
-### Q3: 报错 `ModuleNotFoundError: No module named 'xxx'`
+先确认宿主机可用：
 
-**原因**: 依赖未完整安装
-
-**解决**:
 ```bash
-pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+nvidia-smi
 ```
 
-### Q4: NumPy 版本错误 (`_ARRAY_API not found`)
+再确认 Docker 可用：
 
-**原因**: 安装了 NumPy 2.x，与 onnxruntime 不兼容
-
-**解决**:
 ```bash
-pip install "numpy<2"
+docker run --rm --gpus all nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi
 ```
 
-### Q5: 首帧延迟高 (~6秒)
+如果 Docker 命令失败，需要安装或修复 NVIDIA Container Toolkit。
 
-**原因**: 首次推理需要编译 CUDA kernels
+### 启动提示模型不存在
 
-**解决**:
-1. 服务启动时会自动预热，预热后首帧延迟降至 ~2-3秒
-2. 考虑使用 TensorRT 加速进一步降低延迟
+确认宿主机模型目录：
 
-### Q6: 警告 `synthesis text xxx too short than prompt text`
+```bash
+ls models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml
+```
 
-**原因**: 合成文本比参考音频文本短
+如果不存在，运行：
 
-**解决**: 这个警告对 CosyVoice3 影响较小，可忽略。如需避免，使用更长的合成文本。
+```bash
+cd docker
+docker compose run --rm --entrypoint bash cosyvoice3 -lc "cd /app && python download_model.py"
+```
 
-### Q7: 显存不足 (CUDA OOM)
+### `ref_audio` 找不到
 
-模型实测需要 ~5.2GB 显存，确保 GPU 有足够空间。
+容器内工作目录是 `/app`。相对路径会相对 `/app` 解析。
 
-### Q8: 为什么要设置 `default_prompt_text`？可以随便写吗？
+例如：
 
-**不可以。**
+```json
+{
+  "ref_audio": "asset/longyingwan_woman.wav"
+}
+```
 
-`default_prompt_text` 必须与 `default_prompt_wav` (参考音频) 的内容**完全一致**。
-CosyVoice 需要确切知道参考音频里说了什么字，才能准确提取音色和韵律特征。如果内容不匹配（例如音频里说的是“你好”，文本写的是“天气不错”），会导致音色克隆失败或产生幻觉。
+对应容器内文件：
 
-默认配置：
-- **音频**: `official/asset/zero_shot_prompt.wav`
-- **文本**: `"You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"`
+```text
+/app/asset/longyingwan_woman.wav
+```
 
-如需更换默认音色，请同时替换音频文件和修改代码中的 `default_prompt_text`。
-要求音频清晰（5~15秒为佳，不要过长），保存为wav格式，采集率16kHz,单声道，内容任意，但是和prompt_text里的内容完全一致，必须一字不差！
+### 输出 PCM 无法播放
 
-**作者**：凌封 | **来源**：[aibook.ren (AI全书)](https://aibook.ren)
+PCM 是裸音频，没有 WAV 头。需要指定采样率、位深和声道：
+
+```bash
+ffplay -f s16le -ar 24000 -ac 1 test.pcm
+```
+
+### 生成音色不像参考音频
+
+检查以下项：
+
+- `ref_text` 是否与参考音频逐字一致。
+- 参考音频是否清晰、无噪声、无背景音乐。
+- 参考音频时长是否在 5 到 15 秒左右。
+- 合成文本不要过短，过短文本可能削弱音色表现。
+
+## 本地开发
+
+Docker 是推荐部署方式。本地调试仍可直接运行：
+
+```bash
+python cosyvoice_server.py \
+  --host 0.0.0.0 \
+  --port 10096 \
+  --model_dir models/Fun-CosyVoice3-0.5B \
+  --device cuda \
+  --use_vllm
+```
