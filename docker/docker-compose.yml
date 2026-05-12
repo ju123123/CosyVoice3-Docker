@@ -1,0 +1,40 @@
+services:
+  cosyvoice3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.patch
+
+    image: fun-cosyvoice3-0.5b-2512:2.0
+    container_name: ${CONTAINER_NAME:-fun-cosyvoice3}
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    ports:
+      - "${HOST_PORT:-10096}:${SERVER_PORT:-10096}"
+
+    volumes:
+      - ../models:/app/models
+      - ../asset:/app/asset
+      - ../output:/app/output
+      - ../cache/modelscope:/root/.cache/modelscope
+      - ../cosyvoice:/app/cosyvoice
+      - ./docker-entrypoint.sh:/docker-entrypoint.sh
+      - ../cosyvoice_server.py:/app/cosyvoice_server.py
+      - ../test_client.py:/app/test_client.py
+
+
+    shm_size: "${SHM_SIZE:-8g}"
+    ipc: host
+
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - "${GPU_DEVICE_ID:-1}"
+        capabilities:
+          - gpu

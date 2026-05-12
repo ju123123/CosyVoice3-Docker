@@ -1,0 +1,44 @@
+# Fun-CosyVoice3-0.5B-2512 依赖列表
+# 作者：凌封
+# 来源：https://aibook.ren (AI全书)
+#
+# 安装命令:
+#   pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+#
+# 注意: onnxruntime-gpu 需要单独从微软源安装:
+#   pip install onnxruntime-gpu==1.18.0 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+
+# PyTorch (需要先安装)
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# ===== 核心依赖 =====
+nvidia-cudnn-cu12==8.9.7.29
+numpy<2
+modelscope
+transformers==4.51.3
+x-transformers
+fastapi
+uvicorn
+openai-whisper
+lightning
+scipy
+librosa
+soundfile
+HyperPyYAML
+conformer
+inflect
+wetext
+pydantic
+python-multipart
+omegaconf
+hydra-core
+diffusers
+rich
+networkx
+matplotlib
+gdown
+onnx
+protobuf
+pyworld
+wget
+pyarrow
