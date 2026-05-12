@@ -7,6 +7,7 @@ import io
 import wave
 import base64
 import tempfile
+import shutil
 from urllib.parse import urlparse, unquote
 from urllib.request import urlopen, Request
 from typing import Generator, Optional
@@ -22,7 +23,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 sys.path.insert(0, os.path.join(SCRIPT_DIR, 'third_party', 'Matcha-TTS'))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, Form, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -387,6 +388,138 @@ def error_response(status_code: int, message: str, param: str, code: str) -> JSO
                 "code": code
             }
         }
+    )
+
+
+def save_upload_to_temp_file(upload_file: UploadFile) -> str:
+    suffix = os.path.splitext(upload_file.filename or "")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        upload_file.file.seek(0)
+        shutil.copyfileobj(upload_file.file, tmp)
+        return tmp.name
+
+
+def pcm_stream_response(audio_generator: Generator[bytes, None, None]) -> StreamingResponse:
+    return StreamingResponse(
+        audio_generator,
+        media_type="application/octet-stream",
+        headers={
+            "X-Sample-Rate": str(cosyvoice.sample_rate if cosyvoice else output_sample_rate),
+            "X-Channels": "1",
+            "X-Bits": "16",
+            "X-Audio-Format": "pcm"
+        }
+    )
+
+
+def get_official_inference_method(method_name: str):
+    if cosyvoice is None:
+        raise HTTPException(status_code=503, detail="模型未加载")
+    if not hasattr(cosyvoice, method_name):
+        raise HTTPException(status_code=404, detail=f"当前模型不支持 {method_name}")
+    return getattr(cosyvoice, method_name)
+
+
+def official_pcm_generator(method_name: str, method, *args, cleanup_files: Optional[list[str]] = None) -> Generator[bytes, None, None]:
+    """
+    官方 /inference_* 兼容接口使用的裸 PCM16 流。
+    保持官方示例行为：直接返回模型原生采样率的 PCM，不套 WAV 头。
+    """
+    if cleanup_files is None:
+        cleanup_files = []
+
+    with inference_lock:
+        try:
+            logger.info(f"官方兼容接口调用: {method_name}")
+            for result in method(*args):
+                audio_tensor = result["tts_speech"]
+                yield (audio_tensor * (2 ** 15)).to(torch.int16).cpu().numpy().tobytes()
+        except Exception as e:
+            logger.exception(f"官方兼容接口 {method_name} 生成失败")
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            for path in cleanup_files:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+
+
+@app.get("/inference_sft")
+@app.post("/inference_sft")
+async def inference_sft(tts_text: str = Form(), spk_id: str = Form()):
+    method = get_official_inference_method("inference_sft")
+    return pcm_stream_response(
+        official_pcm_generator("inference_sft", method, tts_text, spk_id)
+    )
+
+
+@app.get("/inference_zero_shot")
+@app.post("/inference_zero_shot")
+async def inference_zero_shot(
+        tts_text: str = Form(),
+        prompt_text: str = Form(),
+        prompt_wav: UploadFile = File()
+):
+    method = get_official_inference_method("inference_zero_shot")
+    prompt_wav_path = save_upload_to_temp_file(prompt_wav)
+    return pcm_stream_response(
+        official_pcm_generator(
+            "inference_zero_shot",
+            method,
+            tts_text,
+            prompt_text,
+            prompt_wav_path,
+            cleanup_files=[prompt_wav_path]
+        )
+    )
+
+
+@app.get("/inference_cross_lingual")
+@app.post("/inference_cross_lingual")
+async def inference_cross_lingual(tts_text: str = Form(), prompt_wav: UploadFile = File()):
+    method = get_official_inference_method("inference_cross_lingual")
+    prompt_wav_path = save_upload_to_temp_file(prompt_wav)
+    return pcm_stream_response(
+        official_pcm_generator(
+            "inference_cross_lingual",
+            method,
+            tts_text,
+            prompt_wav_path,
+            cleanup_files=[prompt_wav_path]
+        )
+    )
+
+
+@app.get("/inference_instruct")
+@app.post("/inference_instruct")
+async def inference_instruct(
+        tts_text: str = Form(),
+        spk_id: str = Form(),
+        instruct_text: str = Form()
+):
+    method = get_official_inference_method("inference_instruct")
+    return pcm_stream_response(
+        official_pcm_generator("inference_instruct", method, tts_text, spk_id, instruct_text)
+    )
+
+
+@app.get("/inference_instruct2")
+@app.post("/inference_instruct2")
+async def inference_instruct2(
+        tts_text: str = Form(),
+        instruct_text: str = Form(),
+        prompt_wav: UploadFile = File()
+):
+    method = get_official_inference_method("inference_instruct2")
+    prompt_wav_path = save_upload_to_temp_file(prompt_wav)
+    return pcm_stream_response(
+        official_pcm_generator(
+            "inference_instruct2",
+            method,
+            tts_text,
+            instruct_text,
+            prompt_wav_path,
+            cleanup_files=[prompt_wav_path]
+        )
     )
 
 
